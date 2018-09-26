@@ -3,13 +3,13 @@ from singer import Transformer
 from singer import utils
 
 import singer
-import tap_s3_csv.s3 as s3
-import tap_s3_csv.csv_handler as csv_handler
+from singer_encodings import csv
+from tap_s3_csv import s3
 
 LOGGER = singer.get_logger()
 
 def sync_stream(config, state, table_spec, stream):
-    table_name = table_spec['name']
+    table_name = table_spec['table_name']
     modified_since = utils.strptime_with_tz(singer.get_bookmark(state, table_name, 'modified_since') or
                                             config['start_date'])
 
@@ -40,20 +40,20 @@ def sync_table_file(config, s3_path, table_spec, stream):
     LOGGER.info('Syncing file "%s".', s3_path)
 
     bucket = config['bucket']
-    table_name = table_spec['name']
+    table_name = table_spec['table_name']
 
     s3_file_handle = s3.get_file_handle(config, s3_path)
-    iterator = csv_handler.get_row_iterator(table_spec, s3_file_handle, s3_path)
+    iterator = csv.get_row_iterator(s3_file_handle._raw_stream, table_spec) #pylint:disable=protected-access
 
     records_synced = 0
 
     for row in iterator:
         custom_columns = {
-            '_s3_source_bucket': bucket,
-            '_s3_source_file': s3_path,
+            s3.SDC_SOURCE_BUCKET_COLUMN: bucket,
+            s3.SDC_SOURCE_FILE_COLUMN: s3_path,
 
             # index zero, +1 for header row
-            '_s3_source_lineno': records_synced + 2
+            s3.SDC_SOURCE_LINENO_COLUMN: records_synced + 2
         }
         rec = {**row, **custom_columns}
 

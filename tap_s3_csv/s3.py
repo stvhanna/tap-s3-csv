@@ -1,26 +1,38 @@
-import json
 import re
+import backoff
 import boto3
+import botocore
 import singer
 
-import tap_s3_csv.conversion as conversion
-import tap_s3_csv.csv_handler as csv_handler
+from singer_encodings import csv
+from tap_s3_csv import conversion
 
 LOGGER = singer.get_logger()
 
-# pylint: disable=broad-except
-def get_bucket_config(bucket):
-    s3_client = boto3.resource('s3')
-    s3_object = s3_client.Object(bucket, 'config.json')
+SDC_SOURCE_BUCKET_COLUMN = "_sdc_source_bucket"
+SDC_SOURCE_FILE_COLUMN = "_sdc_source_file"
+SDC_SOURCE_LINENO_COLUMN = "_sdc_source_lineno"
 
-    try:
-        LOGGER.info("Loading config.json from bucket %s", bucket)
-        config = json.loads(s3_object.get()['Body'].read().decode('utf-8'))
-    except Exception:
-        LOGGER.info("Could not find config.json in bucket %s, using provided config.", bucket)
-        return None
 
-    return config
+def retry_pattern():
+    return backoff.on_exception(backoff.expo,
+                                botocore.exceptions.ClientError,
+                                max_tries=5,
+                                on_backoff=log_backoff_attempt,
+                                factor=10)
+
+
+def log_backoff_attempt(details):
+    LOGGER.info("Error detected communicating with Amazon, triggering backoff: %d try", details.get("tries"))
+
+@retry_pattern()
+def setup_aws_client(config):
+    client = boto3.client('sts')
+    role_arn = "arn:aws:iam::{}:role/{}".format(config['account_id'], config['role_name'])
+
+    role = client.assume_role(RoleArn=role_arn, ExternalId=config['external_id'], RoleSessionName='TapS3CSV')
+    boto3.setup_default_session(aws_access_key_id=role['Credentials']['AccessKeyId'], aws_secret_access_key=role['Credentials']['SecretAccessKey'], aws_session_token=role['Credentials']['SessionToken'])
+
 
 def get_sampled_schema_for_table(config, table_spec):
     LOGGER.info('Sampling records to determine table schema.')
@@ -33,10 +45,10 @@ def get_sampled_schema_for_table(config, table_spec):
     samples = sample_files(config, table_spec, s3_files)
 
     metadata_schema = {
-        '_s3_source_bucket': {'type': 'string'},
-        '_s3_source_file': {'type': 'string'},
-        '_s3_source_lineno': {'type': 'integer'},
-        '_s3_extra': {'type': 'array', 'items': {'type': 'string'}},
+        SDC_SOURCE_BUCKET_COLUMN: {'type': 'string'},
+        SDC_SOURCE_FILE_COLUMN: {'type': 'string'},
+        SDC_SOURCE_LINENO_COLUMN: {'type': 'integer'},
+        csv.SDC_EXTRA_COLUMN: {'type': 'array', 'items': {'type': 'string'}},
     }
 
     data_schema = conversion.generate_schema(samples, table_spec)
@@ -68,12 +80,14 @@ def sample_file(config, table_spec, s3_path, sample_rate, max_records):
     samples = []
 
     file_handle = get_file_handle(config, s3_path)
-    iterator = csv_handler.get_row_iterator(table_spec, file_handle, s3_path)
+    iterator = csv.get_row_iterator(file_handle._raw_stream, table_spec) #pylint:disable=protected-access
 
     current_row = 0
 
     for row in iterator:
         if (current_row % sample_rate) == 0:
+            if row.get(csv.SDC_EXTRA_COLUMN):
+                row.pop(csv.SDC_EXTRA_COLUMN)
             samples.append(row)
 
         current_row += 1
@@ -88,7 +102,7 @@ def sample_file(config, table_spec, s3_path, sample_rate, max_records):
 
 # pylint: disable=too-many-arguments
 def sample_files(config, table_spec, s3_files,
-                 sample_rate=10, max_records=1000, max_files=5):
+                 sample_rate=5, max_records=1000, max_files=5):
     to_return = []
 
     files_so_far = 0
@@ -110,7 +124,7 @@ def get_input_files_for_table(config, table_spec, modified_since=None):
 
     to_return = []
 
-    pattern = table_spec['pattern']
+    pattern = table_spec['search_pattern']
     matcher = re.compile(pattern)
 
     LOGGER.info(
@@ -118,23 +132,31 @@ def get_input_files_for_table(config, table_spec, modified_since=None):
 
     s3_objects = list_files_in_bucket(bucket, table_spec.get('search_prefix'))
 
+    matched_files = []
     for s3_object in s3_objects:
         key = s3_object['Key']
         last_modified = s3_object['LastModified']
 
-        if(matcher.search(key) and
-           (modified_since is None or modified_since < last_modified)):
-            LOGGER.info('Will download key "%s" as it was last modified %s', key, last_modified)
-            to_return.append({'key': key, 'last_modified': last_modified})
+        if matcher.search(key):
+            matched_files.append({'key': key, 'last_modified': last_modified})
+
+    if not matched_files:
+        raise Exception("No files found matching pattern {}".format(pattern))
+
+    for matched_file in matched_files:
+        if modified_since is None or modified_since < matched_file['last_modified']:
+            LOGGER.info('Will download key "%s" as it was last modified %s', matched_file['key'], matched_file['last_modified'])
+            to_return.append(matched_file)
 
     to_return = sorted(to_return, key=lambda item: item['last_modified'])
 
     if not to_return:
-        LOGGER.warning('No files found matching pattern "%s"', pattern)
+        LOGGER.warning('No files found matching pattern "%s" modified since %s', pattern, modified_since)
 
     return to_return
 
 
+@retry_pattern()
 def list_files_in_bucket(bucket, search_prefix=None):
     s3_client = boto3.client('s3')
 
@@ -175,6 +197,7 @@ def list_files_in_bucket(bucket, search_prefix=None):
     return s3_objects
 
 
+@retry_pattern()
 def get_file_handle(config, s3_path):
     bucket = config['bucket']
     s3_client = boto3.resource('s3')
